@@ -10,70 +10,94 @@ mod buffer;
 use buffer::Buffer;
 use core::time::Duration;
 use tendermint_light_client_verifier::{
-    options::Options, types::LightBlock, ProdVerifier, Verdict, Verifier,
+    options::Options, ProdVerifier, Verdict, Verifier,
 };
 use cryptographic_sync_common::{ProgramInput, RecursiveProofInput, RecursiveProgramInput};
-
-const SP1_KEY : &[u8] = include_bytes!("../../../../.sp1/circuits/v3.0.0-rc1/groth16_vk.bin");
+use p3_baby_bear::BabyBear;
+use p3_field::{PrimeField32, AbstractField, PrimeField};
+use p3_bn254_fr::Bn254Fr;
+use sp1_zkvm::lib::utils::{words_to_bytes_le};
 
 // Hash of `/program/elf/riscv32im-succinct-zkvm-elf_v1`
-const ELF_V1_VK : [u8; 32] = [64, 236, 234, 171, 17, 201, 105, 176, 3, 100, 213, 186, 18, 94, 168, 150, 71, 88, 254, 193, 103, 254, 214, 117, 118, 231, 34, 17, 64, 79, 112, 21];
-
-// INPUTS:
-// verifying key
-// public values
-// genesis hash
-// previous header
-// current header
+const ELF_V1_VK : [u8; 32] = [222, 215, 35, 141, 194, 206, 15, 217, 145, 121, 241, 60, 245, 122, 175, 253, 15, 85, 12, 97, 165, 31, 205, 255, 76, 65, 65, 223, 72, 62, 189, 167];
 
 // COMMITS
-// vk hash
+// sha256(vk)
 // genesis hash
 // current header hash
-// `true`
-//
-//
+// verification result (true)
 
-//sp1_zkvm::lib::utils::words_to_bytes_le;
+#[sp1_derive::cycle_tracker]
+fn babybears_to_u32(hash: &[BabyBear; 8]) -> [u32; 8] {
+    hash
+        .iter()
+        .map(|n| n.as_canonical_u32())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap()
+}
+
+//https://github.com/succinctlabs/sp1/blob/2aed8fea16a67a5b2983ffc471b2942c2f2512c8/crates/prover/src/utils.rs#L122C1-L133C2
+/// Convert 8 BabyBear words into a Bn254Fr field element by shifting by 31 bits each time. The last
+/// word becomes the least significant bits.
+#[sp1_derive::cycle_tracker]
+pub fn babybears_to_bn254(digest: &[BabyBear; 8]) -> Bn254Fr {
+    let mut result = Bn254Fr::zero();
+    for word in digest.iter() {
+        // Since BabyBear prime is less than 2^31, we can shift by 31 bits each time and still be
+        // within the Bn254Fr field, so we don't have to truncate the top 3 bits.
+        result *= Bn254Fr::from_canonical_u64(1 << 31);
+        result += Bn254Fr::from_canonical_u32(word.as_canonical_u32());
+    }
+    result
+}
 
 pub fn main() {
+    println!("cycle-tracker-start: wholeshebang");
+
+    println!("cycle-tracker-start: input");
     let serialized_input = sp1_zkvm::io::read_vec();
     let input : ProgramInput = serde_cbor::from_slice(&serialized_input).expect("couldn't deserialize input");
+    println!("cycle-tracker-end: input");
 
+    println!("cycle-tracker-start: post-input");
     let recursive_input = match input {
         ProgramInput::Recursive(input) => input,
-        ProgramInput::Genesis { hash, header }  => {
+        ProgramInput::Genesis { hash, header, vkey }  => {
             if header.signed_header.header().hash().as_bytes() == hash {
+                let sha256_of_vkey = Sha256::digest(&vkey);
+                println!("vk: {sha256_of_vkey:?}");
+                sp1_zkvm::io::commit(&sha256_of_vkey.to_vec());
+                sp1_zkvm::io::commit(&hash);
+                sp1_zkvm::io::commit(&hash);
                 sp1_zkvm::io::commit(&true);
+                println!("cycle-tracker-end: post-input");
+                println!("cycle-tracker-end: wholeshebang");
                 return;
             } else {
                 panic!("expected header == genesis hash");
             }
         }
     };
+    println!("cycle-tracker-end: post-input");
 
-    let hash_of_current_vkey = Sha256::digest(&recursive_input.current_vkey);
+    println!("cycle-tracker-start: debear");
+    let current_vkey_hash_u32 = babybears_to_u32(&recursive_input.current_vkey);
+    println!("cycle-tracker-end: debear");
+
+    let sha256_of_current_vkey_hash = Sha256::digest(words_to_bytes_le(&current_vkey_hash_u32[..]));
     // commit verification key of the currently running program 
-    sp1_zkvm::io::commit_slice(&hash_of_current_vkey);
+    sp1_zkvm::io::commit(&sha256_of_current_vkey_hash.to_vec());
+    println!("vk: {sha256_of_current_vkey_hash:?}");
 
     let hash_of_public_values = Sha256::digest(&recursive_input.public_values);
     let mut public_values_buffer = Buffer::from(&recursive_input.public_values);
 
-    sp1_zkvm::io::commit_slice(&recursive_input.genesis_hash);
+    sp1_zkvm::io::commit(&recursive_input.genesis_hash);
     // commit hash of the header being proved
-    sp1_zkvm::io::commit_slice(&recursive_input.current_header.signed_header.header().hash().as_bytes());
+    sp1_zkvm::io::commit(&recursive_input.current_header.signed_header.header().hash().as_bytes().to_vec());
 
     let hash_of_proof_vkey : Vec<u8> = public_values_buffer.read();
-    let proof_vkey = if *hash_of_proof_vkey == *hash_of_current_vkey {
-        // previous proof has the same vkey
-        recursive_input.current_vkey
-    } else if *hash_of_proof_vkey == ELF_V1_VK { 
-        // vk hash of previous proof matches hardcoded vk, so verifying that we got passed the
-        // correct key shouldn't be necessary
-        recursive_input.previous_vkey
-    } else {
-        panic!("vkey of proof is not one of the allowed vkeys");
-    };
 
     let proof_genesis_hash : Vec<u8> = public_values_buffer.read();
     if proof_genesis_hash != recursive_input.genesis_hash {
@@ -90,17 +114,43 @@ pub fn main() {
         panic!("previous proof invalid");
     }
 
+    println!("cycle-tracker-start: recursive");
     match recursive_input.recursive_proof_input {
         RecursiveProofInput::Sp1 => {
-            sp1_zkvm::lib::verify::verify_sp1_proof(proof_vkey, &hash_of_public_values[0..32]);
+            let proof_vkey_hash = if *hash_of_proof_vkey == *sha256_of_current_vkey_hash {
+                // previous proof has the same vkey
+                current_vkey_hash_u32
+            } else if *hash_of_proof_vkey == ELF_V1_VK { 
+                // vk hash of previous proof matches hardcoded vk, so verifying that we got passed the
+                // correct key shouldn't be necessary
+                babybears_to_u32(&recursive_input.previous_vkey)
+            } else {
+                panic!("verify sp1: vkey of proof is not one of the allowed vkeys");
+            };
+
+            sp1_zkvm::lib::verify::verify_sp1_proof(&proof_vkey_hash, &hash_of_public_values.into());
         }
-        RecursiveProofInput::Groth16(raw_proof) => {
-            Groth16Verifier::verify(raw_proof, &recursive_input.public_values, proof_vkey, &SP1_KEY).expect("groth16 verification failed");
+        RecursiveProofInput::Groth16 { proof, sp1_key } => {
+            let proof_vkey_hash = if *hash_of_proof_vkey == *sha256_of_current_vkey_hash {
+                // previous proof has the same vkey
+                recursive_input.current_vkey
+            } else if *hash_of_proof_vkey == ELF_V1_VK { 
+                // vk hash of previous proof matches hardcoded vk, so verifying that we got passed the
+                // correct key shouldn't be necessary
+                recursive_input.previous_vkey
+            } else {
+                panic!("verify groth16: vkey of proof is not one of the allowed vkeys");
+            };
+
+            // https://docs.rs/sp1-prover/3.0.0-rc1/src/sp1_prover/types.rs.html#56
+            let vkey_digest_bn254 = babybears_to_bn254(&proof_vkey_hash);
+            let vkey_digest_bytes32 = format!("0x{:0>64}", vkey_digest_bn254.as_canonical_biguint().to_str_radix(16));
+            Groth16Verifier::verify(&proof, &recursive_input.public_values, &vkey_digest_bytes32, &sp1_key).expect("groth16 verification failed");
         }
     }
+    println!("cycle-tracker-end: recursive");
 
-    println!("tendermint time");
-
+    println!("cycle-tracker-start: tendermint");
     let RecursiveProgramInput {previous_header, current_header, ..} = recursive_input;
 
     // Perform Tendermint (Celestia consensus) verification
@@ -127,12 +177,14 @@ pub fn main() {
             panic!("consensus verification failed!");
         }
     }
-    println!("Exiting??");
+    println!("cycle-tracker-end: tendermint");
+
+    println!("cycle-tracker-end: wholeshebang");
 
     return;
 }
 
-    
+/*
 fn old_main() {
     let groth_mode : bool = sp1_zkvm::io::read();
     let prev_vkey: [u32; 8] = sp1_zkvm::io::read();
@@ -248,3 +300,4 @@ fn old_main() {
 
     return;
 }
+*/

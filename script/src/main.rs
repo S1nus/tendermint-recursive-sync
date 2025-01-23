@@ -1,25 +1,25 @@
 use std::fs::{self, File};
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
-use std::{io::Write, path::Path};
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use cryptographic_sync_common::{RecursiveProofInput, RecursiveProgramInput, ProgramInput};
+use cryptographic_sync_common::{ProgramInput, RecursiveProgramInput, RecursiveProofInput};
 use serde_json;
-use sp1_sdk::{HashableKey, SP1VerifyingKey};
-use sp1_sdk::{ProverClient, SP1Stdin};
-use sp1_sdk::{SP1Proof, SP1ProofWithPublicValues};
-use tendermint_light_client_verifier::{
-    options::Options, types::LightBlock, ProdVerifier, Verdict, Verifier,
+use sp1_sdk::{
+    HashableKey, ProverClient, SP1Proof, SP1ProofWithPublicValues, SP1Stdin
 };
+use tendermint_light_client_verifier::types::LightBlock;
+
+//use tendermint_light_client_verifier::{ options::Options, ProdVerifier, Verdict, Verifier, };
 
 mod tm_rpc_types;
 mod tm_rpc_utils;
 
 use tm_rpc_utils::TendermintRPCClient;
 
-pub const ELF: &[u8] = include_bytes!("../../program/elf/riscv32im-succinct-zkvm-elf");
-pub const PREV_ELF: &[u8] = include_bytes!("../../program/elf/riscv32im-succinct-zkvm-elf_v1");
+const ELF: &[u8] = include_bytes!("../../program/elf/riscv32im-succinct-zkvm-elf");
+const PREV_ELF: &[u8] = include_bytes!("../../program/elf/riscv32im-succinct-zkvm-elf_v1");
+
+const SP1_GROTH16_VK_V3_0_0 : &[u8] = include_bytes!("../groth16_vk-3.0.0-rc1.bin");
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -28,7 +28,8 @@ struct Cli {
     proof: Option<PathBuf>,
     #[arg(long, default_value = "header_cache")]
     header_cache_dir: PathBuf,
-    //#[command(subcommand)] command: Commands,
+    #[arg(long, default_value_t = false)]
+    groth16: bool
 }
 
 #[derive(Debug, Subcommand)]
@@ -66,28 +67,42 @@ async fn main() -> anyhow::Result<()> {
     let client = tm_rpc_utils::TendermintRPCClient::default();
     let genesis = get_cache_or_fetch(1, &client, cli.header_cache_dir.as_ref()).await;
 
+    sp1_sdk::utils::setup_logger();
     let mut stdin = SP1Stdin::new();
 
     let prover_client = ProverClient::new();
     let (_, prev_vk) = prover_client.setup(PREV_ELF);
     let (pk, vk) = prover_client.setup(ELF);
 
-    println!("= {:?}", prev_vk.hash_bytes());
+    println!("PREV = {:?}", prev_vk.hash_bytes());
+    println!("VK   = {:?}", vk.hash_bytes());
 
     let program_input = if cli.unproven_height == 1 {
         ProgramInput::Genesis {
             hash: genesis.signed_header.header().hash().as_bytes().to_vec(),
             header: genesis,
+            vkey: vk.hash_bytes(),
         }
     } else {
         let proof_path = cli.proof.expect("missing proof for previous header");
         let proof_file = File::open(proof_path).expect("could not open proof file");
 
-        let SP1ProofWithPublicValues {
-            proof,
-            public_values,
-            ..
-        } = serde_json::from_reader(proof_file).expect("could not parse proof");
+        let proof_with_public_values: SP1ProofWithPublicValues =
+            serde_json::from_reader(proof_file).expect("could not parse proof");
+
+        let proof_input = match proof_with_public_values.proof {
+            // default mode for moving forward, since it's more performant
+            SP1Proof::Compressed(p) => {
+                stdin.write_proof(*p, prev_vk.vk.clone());
+                RecursiveProofInput::Sp1
+            }
+            // groth16 is used for upgrades (so we use previous vk)
+            SP1Proof::Groth16(_) => RecursiveProofInput::Groth16 {
+                proof: proof_with_public_values.bytes(),
+                sp1_key: SP1_GROTH16_VK_V3_0_0.to_vec(),
+            },
+            _ => unimplemented!("unsupported proof type"),
+        };
 
         let proven_header = get_cache_or_fetch(
             cli.unproven_height - 1,
@@ -98,29 +113,14 @@ async fn main() -> anyhow::Result<()> {
         let unproven_header =
             get_cache_or_fetch(cli.unproven_height, &client, cli.header_cache_dir.as_ref()).await;
 
-        let proof_input = match proof {
-            // default mode for moving forward, since it's more performant
-            SP1Proof::Compressed(p) => {
-                stdin.write_proof(*p, prev_vk.vk);
-                RecursiveProofInput::Sp1
-            }
-            // groth16 is used for upgrades (so we use previous vk)
-            SP1Proof::Groth16(p) => {
-                ProgramInput::Groth16(p.raw_proof)
-
-                todo!()
-            }
-            _ => unimplemented!("unsupported proof type"),
-        };
-
         ProgramInput::Recursive(RecursiveProgramInput {
-            public_values: public_values.to_vec(),
+            public_values: proof_with_public_values.public_values.to_vec(),
             genesis_hash: genesis.signed_header.header().hash().as_bytes().to_vec(),
             recursive_proof_input: proof_input,
             previous_header: proven_header,
             current_header: unproven_header,
-            current_vkey: vk.hash_bytes(),
-            previous_vkey: prev_vk.hash_bytes(),
+            current_vkey: vk.hash_babybear(),
+            previous_vkey: prev_vk.hash_babybear(),
         })
     };
 
@@ -128,17 +128,30 @@ async fn main() -> anyhow::Result<()> {
         serde_cbor::to_vec(&program_input).expect("failed to serialise program input");
     stdin.write_vec(serialized_input);
 
+    let proof = prover_client .prove(&pk, stdin);
+    if cli.groth16 {
+        let groth16_proof = proof.groth16() .run() .expect("could not prove");
 
-    return Ok(()); 
-    /*
-    match cli.command {
-        Commands::Sp1 { proof_path } => {
-            let proof_file = File::open(proof_path).expect("could not open proof file");
-        }
-        _ => todo!()
+        fs::write(
+            format!("{}_groth16_proof.json", cli.unproven_height),
+            serde_json::to_string(&groth16_proof).expect("could not json serialize"),
+        ) .expect("could not write");
+    } else {
+        let sp1_proof = proof.compressed() .run() .expect("could not prove");
+
+        fs::write(
+            format!("{}_proof.json", cli.unproven_height),
+            serde_json::to_string(&sp1_proof).expect("could not json serialize"),
+        ) .expect("could not write");
     }
-    */
+    println!("the vkey: {:?}", vk.vk);
 
+    return Ok(());
+
+}
+
+/*
+fn olde_main() {
     println!("creating rpc client");
     let peer_id = client.fetch_peer_id().await.unwrap();
     println!("getting genesis...");
@@ -283,3 +296,4 @@ async fn main() -> anyhow::Result<()> {
     */
     Ok(())
 }
+*/

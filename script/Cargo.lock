@@ -1183,6 +1183,7 @@ dependencies = [
 name = "cryptographic_sync-common"
 version = "0.1.0"
 dependencies = [
+ "p3-baby-bear",
  "serde",
  "tendermint-light-client-verifier",
 ]
