@@ -10,8 +10,6 @@ use tendermint::{
 };
 use tendermint_light_client_verifier::types::{LightBlock, ValidatorSet};
 
-
-
 pub struct TendermintRPCClient {
     url: String,
 }
