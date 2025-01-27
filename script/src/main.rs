@@ -2,11 +2,11 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use cryptographic_sync_common::{ProgramInput, RecursiveProgramInput, RecursiveProofInput, Buffer};
+use cryptographic_sync_common::{Buffer, ProgramInput, RecursiveProgramInput, RecursiveProofInput};
 use serde_json;
+use sha2::{Digest, Sha256};
 use sp1_sdk::{HashableKey, ProverClient, SP1Proof, SP1ProofWithPublicValues, SP1Stdin};
 use tendermint_light_client_verifier::types::LightBlock;
-use sha2::{Sha256, Digest};
 
 mod tm_rpc_types;
 mod tm_rpc_utils;
@@ -87,15 +87,23 @@ async fn main() -> anyhow::Result<()> {
         let proof_with_public_values: SP1ProofWithPublicValues =
             serde_json::from_reader(proof_file).expect("could not parse proof");
 
-        let vk_le : Vec<_> = vk.hash_u32().into_iter().flat_map(|i| i.to_le_bytes()).collect();
-        let prev_vk_le : Vec<_> = prev_vk.hash_u32().into_iter().flat_map(|i| i.to_le_bytes()).collect();
+        let vk_le: Vec<_> = vk
+            .hash_u32()
+            .into_iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+        let prev_vk_le: Vec<_> = prev_vk
+            .hash_u32()
+            .into_iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
         let current_vk_digest = Sha256::digest(&vk_le);
         let previous_vk_digest = Sha256::digest(&prev_vk_le);
         println!("current hash = {:?}", current_vk_digest);
         println!("previous hash = {:?}", previous_vk_digest);
 
         let mut public_values = Buffer::from(&proof_with_public_values.public_values.as_slice());
-        let proof_vkey_digest : Vec<u8> = public_values.read();
+        let proof_vkey_digest: Vec<u8> = public_values.read();
         println!("public values vkey = {:?}", proof_vkey_digest);
 
         let proof_vkey_override = if *proof_vkey_digest == *previous_vk_digest {
@@ -159,7 +167,15 @@ async fn main() -> anyhow::Result<()> {
         .expect("could not write");
     } else {
         let sp1_proof = proof.compressed().run().expect("could not prove");
-        println!("writing key: {:?}", sp1_proof.proof.try_as_compressed_ref().unwrap().vk.hash_bytes());
+        println!(
+            "writing key: {:?}",
+            sp1_proof
+                .proof
+                .try_as_compressed_ref()
+                .unwrap()
+                .vk
+                .hash_bytes()
+        );
 
         fs::write(
             format!("{}_proof.json", cli.unproven_height),
@@ -171,151 +187,3 @@ async fn main() -> anyhow::Result<()> {
 
     return Ok(());
 }
-
-/*
-fn olde_main() {
-    println!("creating rpc client");
-    let peer_id = client.fetch_peer_id().await.unwrap();
-    println!("getting genesis...");
-    //let genesis = client.fetch_light_block(1, peer_id).await.unwrap();
-    let genesis = get_cache_or_fetch(1, &client, cli.header_cache_dir.as_ref()).await;
-
-    let next = 2341561;
-
-    let left_off_proof_file =
-        File::open("2341560_proof.json").expect("could not open left_off_proof.json");
-    let mut running_proof: SP1ProofWithPublicValues =
-        serde_json::from_reader(left_off_proof_file).expect("could not parse");
-
-    let running_header_file = File::open("needed_headers/2341560.json").unwrap();
-    let mut running_head: Option<LightBlock> =
-        serde_json::from_reader(running_header_file).unwrap();
-
-    // header where i got booted off wifi
-    let left_off: String = "2341560".to_string();
-
-    let next_light_block = client.fetch_light_block(next, peer_id).await.unwrap();
-    println!("Fetched {}", next_light_block.signed_header.header.height);
-
-    let maybe_groth16_proof = if let Ok(groth_proof_file) = File::open("2341561_groth16_proof.json")
-    {
-        println!("GROTH16 MODE");
-        let proof: SP1ProofWithPublicValues =
-            serde_json::from_reader(groth_proof_file).expect("could not parse");
-        //let groth_proof = proof.proof.try_as_groth_16().expect("groth proof");
-        //Some(groth_proof.raw_proof.as_bytes())
-        Some(proof)
-    } else {
-        None
-    };
-
-    let prover_client = ProverClient::new();
-    let (_, prev_vk) = prover_client.setup(PREV_ELF);
-    let (pk, vk) = prover_client.setup(ELF);
-    let running_proof_public_values = running_proof.public_values.to_vec();
-
-    let mut stdin = SP1Stdin::new();
-    stdin.write(&maybe_groth16_proof.is_some());
-    stdin.write(&prev_vk.hash_u32());
-    stdin.write(&vk.hash_u32());
-    if let Some(proof) = &maybe_groth16_proof {
-        stdin.write(&proof.public_values.to_vec());
-    } else {
-        stdin.write(&running_proof_public_values);
-    }
-    stdin.write_vec(
-        genesis
-            .clone()
-            .signed_header
-            .header()
-            .hash()
-            .as_bytes()
-            .to_vec(),
-    );
-    let encoded1 = serde_cbor::to_vec(&running_head).expect("failed to serialise running head");
-    stdin.write_vec(encoded1);
-    let next_header: Option<LightBlock> = Some(next_light_block);
-
-    let encoded2 = serde_cbor::to_vec(&next_header).expect("coudl not serialize");
-    stdin.write_vec(encoded2);
-    let running_proof_inner = *match running_proof.proof.clone() {
-        SP1Proof::Compressed(c) => c,
-        _ => panic!("Not the right kind of SP1 proof"),
-    };
-    stdin.write_proof(running_proof_inner, prev_vk.vk.clone());
-    println!("creating proof for {}", next);
-
-    if let Some(groth_proof) = maybe_groth16_proof {
-        let groth_proof = groth_proof.proof.try_as_groth_16().expect("groth proof");
-        let encoded_groth = serde_cbor::to_vec(&groth_proof.raw_proof.as_bytes())
-            .expect("failed to serialise groth16");
-        stdin.write_vec(encoded_groth);
-        stdin.write(&vk.bytes32())
-    } else {
-        //let encoded_groth = serde_cbor::to_vec(&None::<Groth16Bn254Proof>).expect("failed to serialise groth16");
-        //stdin.write_vec(encoded_groth);
-        //stdin.write(&"");
-    }
-
-    running_proof = prover_client
-        .prove(&pk, stdin)
-        .groth16()
-        .run()
-        .expect("could not prove");
-    fs::write(
-        format!("{}_groth16_proof.json", next),
-        serde_json::to_string(&running_proof).expect("could not json serialize"),
-    )
-    .expect("could not write");
-    println!("the vkey: {:?}", vk.vk);
-
-    /*
-    println!("lloop: {:?}", start..files.len());
-    for i in start..files.len() {
-        let prover_client = ProverClient::new();
-        let (pk, vk) = prover_client.setup(ELF);
-        let running_proof_public_values = running_proof.public_values.to_vec();
-        let mut stdin = SP1Stdin::new();
-        stdin.write(&vk.hash_u32());
-        stdin.write(&running_proof_public_values);
-        stdin.write_vec(
-            genesis
-                .clone()
-                .signed_header
-                .header()
-                .hash()
-                .as_bytes()
-                .to_vec(),
-        );
-        let encoded1 = serde_cbor::to_vec(&running_head).expect("failed to serialzie running head");
-        stdin.write_vec(encoded1);
-        let next_header_file = File::open(format!("needed_headers/{}.json", &files[i]))
-            .expect("Could not open");
-        let next_header: Option<LightBlock> =
-            Some(serde_json::from_reader(next_header_file).expect("could not parse"));
-        let encoded2 = serde_cbor::to_vec(&next_header).expect("coudl not serialize");
-        stdin.write_vec(encoded2);
-        let running_proof_inner = *match running_proof.proof.clone() {
-            SP1Proof::Compressed(c) => c,
-            _ => panic!("Not the right kind of SP1 proof"),
-        };
-        stdin.write_proof(running_proof_inner, vk.vk.clone());
-        println!("creating proof for {}", files[i]);
-        running_proof = prover_client
-            .prove(&pk, stdin)
-            .groth16()
-            .run()
-            .expect("could not prove");
-        fs::write(
-            format!("{}_groth16_proof.json", files[i]),
-            serde_json::to_string(&running_proof).expect("could not json serialize"),
-        )
-        .expect("could not write");
-        println!("the vkey: {:?}", vk.vk);
-        return Ok(());
-        running_head = next_header;
-    }
-    */
-    Ok(())
-}
-*/
