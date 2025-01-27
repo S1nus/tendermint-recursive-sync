@@ -6,19 +6,17 @@ sp1_zkvm::entrypoint!(main);
 use sp1_verifier::Groth16Verifier;
 
 use sha2::{Sha256, Digest};
-mod buffer;
-use buffer::Buffer;
 use core::time::Duration;
 use tendermint_light_client_verifier::{
     options::Options, ProdVerifier, Verdict, Verifier,
 };
-use cryptographic_sync_common::{ProgramInput, RecursiveProofInput, RecursiveProgramInput};
+use cryptographic_sync_common::{Buffer, ProgramInput, RecursiveProofInput, RecursiveProgramInput};
 use p3_baby_bear::BabyBear;
 use p3_field::{PrimeField32, AbstractField, PrimeField};
 use p3_bn254_fr::Bn254Fr;
 use sp1_zkvm::lib::utils::{words_to_bytes_le};
 
-// Hash of `/program/elf/riscv32im-succinct-zkvm-elf_v1`
+// `/program/elf/riscv32im-succinct-zkvm-elf_v1`
 const ELF_V1_VK : [u8; 32] = [222, 215, 35, 141, 194, 206, 15, 217, 145, 121, 241, 60, 245, 122, 175, 253, 15, 85, 12, 97, 165, 31, 205, 255, 76, 65, 65, 223, 72, 62, 189, 167];
 
 // COMMITS
@@ -65,7 +63,7 @@ pub fn main() {
         ProgramInput::Recursive(input) => input,
         ProgramInput::Genesis { hash, header, vkey }  => {
             if header.signed_header.header().hash().as_bytes() == hash {
-                let sha256_of_vkey = Sha256::digest(&vkey);
+                let sha256_of_vkey = Sha256::digest(&words_to_bytes_le(&vkey));
                 println!("vk: {sha256_of_vkey:?}");
                 sp1_zkvm::io::commit(&sha256_of_vkey.to_vec());
                 sp1_zkvm::io::commit(&hash);
@@ -117,30 +115,12 @@ pub fn main() {
     println!("cycle-tracker-start: recursive");
     match recursive_input.recursive_proof_input {
         RecursiveProofInput::Sp1 => {
-            let proof_vkey_hash = if *hash_of_proof_vkey == *sha256_of_current_vkey_hash {
-                // previous proof has the same vkey
-                current_vkey_hash_u32
-            } else if *hash_of_proof_vkey == ELF_V1_VK { 
-                // vk hash of previous proof matches hardcoded vk, so verifying that we got passed the
-                // correct key shouldn't be necessary
-                babybears_to_u32(&recursive_input.previous_vkey)
-            } else {
-                panic!("verify sp1: vkey of proof is not one of the allowed vkeys");
-            };
+            let proof_vkey_hash = recursive_input.proof_vkey_override.as_ref().map(babybears_to_u32).unwrap_or(current_vkey_hash_u32);
 
             sp1_zkvm::lib::verify::verify_sp1_proof(&proof_vkey_hash, &hash_of_public_values.into());
         }
         RecursiveProofInput::Groth16 { proof, sp1_key } => {
-            let proof_vkey_hash = if *hash_of_proof_vkey == *sha256_of_current_vkey_hash {
-                // previous proof has the same vkey
-                recursive_input.current_vkey
-            } else if *hash_of_proof_vkey == ELF_V1_VK { 
-                // vk hash of previous proof matches hardcoded vk, so verifying that we got passed the
-                // correct key shouldn't be necessary
-                recursive_input.previous_vkey
-            } else {
-                panic!("verify groth16: vkey of proof is not one of the allowed vkeys");
-            };
+            let proof_vkey_hash = recursive_input.proof_vkey_override.unwrap_or(recursive_input.current_vkey);
 
             // https://docs.rs/sp1-prover/3.0.0-rc1/src/sp1_prover/types.rs.html#56
             let vkey_digest_bn254 = babybears_to_bn254(&proof_vkey_hash);

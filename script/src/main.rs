@@ -2,14 +2,11 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use cryptographic_sync_common::{ProgramInput, RecursiveProgramInput, RecursiveProofInput};
+use cryptographic_sync_common::{ProgramInput, RecursiveProgramInput, RecursiveProofInput, Buffer};
 use serde_json;
-use sp1_sdk::{
-    HashableKey, ProverClient, SP1Proof, SP1ProofWithPublicValues, SP1Stdin
-};
+use sp1_sdk::{HashableKey, ProverClient, SP1Proof, SP1ProofWithPublicValues, SP1Stdin};
 use tendermint_light_client_verifier::types::LightBlock;
-
-//use tendermint_light_client_verifier::{ options::Options, ProdVerifier, Verdict, Verifier, };
+use sha2::{Sha256, Digest};
 
 mod tm_rpc_types;
 mod tm_rpc_utils;
@@ -19,7 +16,7 @@ use tm_rpc_utils::TendermintRPCClient;
 const ELF: &[u8] = include_bytes!("../../program/elf/riscv32im-succinct-zkvm-elf");
 const PREV_ELF: &[u8] = include_bytes!("../../program/elf/riscv32im-succinct-zkvm-elf_v1");
 
-const SP1_GROTH16_VK_V3_0_0 : &[u8] = include_bytes!("../groth16_vk-3.0.0-rc1.bin");
+const SP1_GROTH16_VK_V3_0_0: &[u8] = include_bytes!("../groth16_vk-3.0.0-rc1.bin");
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -29,7 +26,7 @@ struct Cli {
     #[arg(long, default_value = "header_cache")]
     header_cache_dir: PathBuf,
     #[arg(long, default_value_t = false)]
-    groth16: bool
+    groth16: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -81,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
         ProgramInput::Genesis {
             hash: genesis.signed_header.header().hash().as_bytes().to_vec(),
             header: genesis,
-            vkey: vk.hash_bytes(),
+            vkey: vk.hash_u32(),
         }
     } else {
         let proof_path = cli.proof.expect("missing proof for previous header");
@@ -90,10 +87,33 @@ async fn main() -> anyhow::Result<()> {
         let proof_with_public_values: SP1ProofWithPublicValues =
             serde_json::from_reader(proof_file).expect("could not parse proof");
 
+        let vk_le : Vec<_> = vk.hash_u32().into_iter().flat_map(|i| i.to_le_bytes()).collect();
+        let prev_vk_le : Vec<_> = prev_vk.hash_u32().into_iter().flat_map(|i| i.to_le_bytes()).collect();
+        let current_vk_digest = Sha256::digest(&vk_le);
+        let previous_vk_digest = Sha256::digest(&prev_vk_le);
+        println!("current hash = {:?}", current_vk_digest);
+        println!("previous hash = {:?}", previous_vk_digest);
+
+        let mut public_values = Buffer::from(&proof_with_public_values.public_values.as_slice());
+        let proof_vkey_digest : Vec<u8> = public_values.read();
+        println!("public values vkey = {:?}", proof_vkey_digest);
+
+        let proof_vkey_override = if *proof_vkey_digest == *previous_vk_digest {
+            Some(prev_vk.hash_babybear())
+        } else if *proof_vkey_digest == *current_vk_digest {
+            None
+        } else {
+            panic!("proof vkey is not one of the expected ones. regenerate proofs?");
+        };
+
         let proof_input = match proof_with_public_values.proof {
             // default mode for moving forward, since it's more performant
             SP1Proof::Compressed(p) => {
-                stdin.write_proof(*p, prev_vk.vk.clone());
+                if proof_vkey_override.is_some() {
+                    stdin.write_proof(*p, prev_vk.vk);
+                } else {
+                    stdin.write_proof(*p, vk.vk.clone());
+                }
                 RecursiveProofInput::Sp1
             }
             // groth16 is used for upgrades (so we use previous vk)
@@ -120,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
             previous_header: proven_header,
             current_header: unproven_header,
             current_vkey: vk.hash_babybear(),
-            previous_vkey: prev_vk.hash_babybear(),
+            proof_vkey_override,
         })
     };
 
@@ -128,26 +148,28 @@ async fn main() -> anyhow::Result<()> {
         serde_cbor::to_vec(&program_input).expect("failed to serialise program input");
     stdin.write_vec(serialized_input);
 
-    let proof = prover_client .prove(&pk, stdin);
+    let proof = prover_client.prove(&pk, stdin);
     if cli.groth16 {
-        let groth16_proof = proof.groth16() .run() .expect("could not prove");
+        let groth16_proof = proof.groth16().run().expect("could not prove");
 
         fs::write(
             format!("{}_groth16_proof.json", cli.unproven_height),
             serde_json::to_string(&groth16_proof).expect("could not json serialize"),
-        ) .expect("could not write");
+        )
+        .expect("could not write");
     } else {
-        let sp1_proof = proof.compressed() .run() .expect("could not prove");
+        let sp1_proof = proof.compressed().run().expect("could not prove");
+        println!("writing key: {:?}", sp1_proof.proof.try_as_compressed_ref().unwrap().vk.hash_bytes());
 
         fs::write(
             format!("{}_proof.json", cli.unproven_height),
             serde_json::to_string(&sp1_proof).expect("could not json serialize"),
-        ) .expect("could not write");
+        )
+        .expect("could not write");
     }
     println!("the vkey: {:?}", vk.vk);
 
     return Ok(());
-
 }
 
 /*

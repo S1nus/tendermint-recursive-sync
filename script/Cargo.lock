@@ -1183,6 +1183,7 @@ dependencies = [
 name = "cryptographic_sync-common"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "p3-baby-bear",
  "serde",
  "tendermint-light-client-verifier",
@@ -1200,6 +1201,7 @@ dependencies = [
  "serde",
  "serde_cbor",
  "serde_json",
+ "sha2 0.10.8",
  "sp1-helper",
  "sp1-sdk",
  "subtle-encoding",
