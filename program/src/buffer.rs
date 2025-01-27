@@ -31,6 +31,7 @@ impl Buffer {
 
     /// Read the serializable object from the buffer.
     pub fn read<T: Serialize + DeserializeOwned>(&mut self) -> T {
+        println!("Reading {}", std::any::type_name::<T>());
         let result: T =
             bincode::deserialize(&self.data[self.ptr..]).expect("failed to deserialize");
         let nb_bytes = bincode::serialized_size(&result).expect("failed to get serialized size");
